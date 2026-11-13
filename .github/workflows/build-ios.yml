@@ -85,6 +85,7 @@ jobs:
         run: |
           git am ios-export-memory-fix.patch
           git am high-memory-export.patch
+          git am preserve-export-metadata.patch
       - name: Select Xcode 27.2
         run: |
           set -euo pipefail
