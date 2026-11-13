@@ -1,0 +1,186 @@
+name: Build LightCraft iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - lightcraft-ios
+    paths:
+      - 'lightcraft-ios/**'
+      - '.github/workflows/build-lightcraft-ios.yml'
+
+concurrency:
+  group: lightcraft-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      LIGHTCRAFT_VERSION: 0.21.1
+      LIGHTCRAFT_SHA256: 57147383a46eaab3b0cc036acf9443b221450c6a19f5dc303ae165bb9678b8cb
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract iOS wrapper
+        run: |
+          set -euo pipefail
+          rm -rf build/lightcraft-src
+          mkdir -p build/lightcraft-src
+          unzip -q lightcraft-ios/lightcraft-ios-source.zip -d build/lightcraft-src
+          test -f build/lightcraft-src/project.yml
+          test -d build/lightcraft-src/LightCraft/App
+
+      - name: Download the official LightCraft web build
+        run: |
+          set -euo pipefail
+          mkdir -p build/web
+          curl -fL \
+            "https://github.com/storytold/lightcraft/releases/download/v${LIGHTCRAFT_VERSION}/lightcraft-web-${LIGHTCRAFT_VERSION}.zip" \
+            -o build/lightcraft-web.zip
+          echo "${LIGHTCRAFT_SHA256}  build/lightcraft-web.zip" | shasum -a 256 -c -
+          unzip -q build/lightcraft-web.zip -d build/web
+          source_dir="$(dirname "$(find build/web -name index.html -print -quit)")"
+          destination="build/lightcraft-src/LightCraft/Resources/Web"
+          rm -rf "$destination"
+          mkdir -p "$destination"
+          cp -R "$source_dir"/. "$destination"/
+          find "$destination" -type f \( -name '*.gz' -o -name '*.br' \) -delete
+          du -sh "$destination"
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate the Xcode project
+        working-directory: build/lightcraft-src
+        run: |
+          set -euo pipefail
+          xcodegen generate
+
+      - name: Build unsigned app
+        working-directory: build/lightcraft-src
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LightCraft.xcodeproj \
+            -scheme LightCraft \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            build | tee build/xcodebuild.log
+
+      - name: Package unsigned IPA
+        working-directory: build/lightcraft-src
+        run: |
+          set -euo pipefail
+          app="build/DerivedData/Build/Products/Release-iphoneos/LightCraft.app"
+          test -d "$app"
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          ditto --norsrc --noextattr --noqtn "$app" build/Payload/LightCraft.app
+          plutil -convert xml1 build/Payload/LightCraft.app/Info.plist
+          python3 - build/Payload build/LightCraft-unsigned.ipa <<'PY'
+          import os
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          source = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(source.rglob("*")):
+                  name = path.relative_to(source.parent).as_posix()
+                  if path.is_dir():
+                      name += "/"
+                  info = zipfile.ZipInfo(name)
+                  info.create_system = 3
+                  mode = path.stat().st_mode
+                  info.external_attr = (mode & 0xFFFF) << 16
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  if path.is_dir():
+                      archive.writestr(info, b"")
+                  else:
+                      archive.writestr(info, path.read_bytes())
+          print(destination, destination.stat().st_size)
+          PY
+          unzip -p build/LightCraft-unsigned.ipa Payload/LightCraft.app/Info.plist > build/shipped.plist
+          echo "bundle id: $(plutil -extract CFBundleIdentifier raw - < build/shipped.plist)"
+          echo "version:   $(plutil -extract CFBundleShortVersionString raw - < build/shipped.plist)"
+          echo "minimum:   $(plutil -extract MinimumOSVersion raw - < build/shipped.plist)"
+          unzip -l build/LightCraft-unsigned.ipa | sed -n '1,12p'
+
+      - name: Verify packaged assets
+        working-directory: build/lightcraft-src
+        run: |
+          set -euo pipefail
+          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Web/lightcraft_web_bg.wasm'
+          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Wrapper/index.html'
+          test "$(unzip -Z -1 build/LightCraft-unsigned.ipa | wc -l | tr -d ' ')" -gt 10
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightCraft-iOS-unsigned
+          path: build/lightcraft-src/build/LightCraft-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish rolling release
+        working-directory: build/lightcraft-src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::7}"
+          name="LightCraft-iOS-${LIGHTCRAFT_VERSION}-${short}-unsigned.ipa"
+          mkdir -p build/release
+          cp build/LightCraft-unsigned.ipa "build/release/$name"
+          shasum -a 256 "build/release/$name" > "build/release/SHA256SUMS.txt"
+          notes="$(mktemp)"
+          {
+            echo "LightCraft ${LIGHTCRAFT_VERSION} 的 WKWebView iOS 容器。"
+            echo ""
+            echo "安装包未签名，请使用 SideStore、AltStore 或 Sideloadly 以自己的 Apple ID 重签。"
+            echo "照片库保存在应用的浏览器存储中；导出文件同时保存到相册和“文件”App 的 LightCraft Exports。"
+          } > "$notes"
+          if gh release view lightcraft-ios-latest >/dev/null 2>&1; then
+            gh release edit lightcraft-ios-latest \
+              --target "$GITHUB_SHA" \
+              --title "LightCraft iOS 最新构建（${short}）" \
+              --notes-file "$notes"
+          else
+            gh release create lightcraft-ios-latest \
+              --target "$GITHUB_SHA" \
+              --title "LightCraft iOS 最新构建（${short}）" \
+              --notes-file "$notes"
+          fi
+          gh release upload lightcraft-ios-latest \
+            "build/release/$name" \
+            "build/release/SHA256SUMS.txt" \
+            --clobber
+          gh release view lightcraft-ios-latest --json url,assets \
+            --jq '.url, (.assets[] | "\(.name)  \(.size) bytes")'
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LightCraft-iOS-build-log
+          path: |
+            build/lightcraft-src/build/xcodebuild.log
+          if-no-files-found: ignore
