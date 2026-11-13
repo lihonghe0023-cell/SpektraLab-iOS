@@ -82,7 +82,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Apply export memory fix
-        run: git am ios-export-memory-fix.patch
+        run: |
+          git am ios-export-memory-fix.patch
+          git am high-memory-export.patch
       - name: Select Xcode 27.2
         run: |
           set -euo pipefail
