@@ -129,8 +129,8 @@ jobs:
         working-directory: build/lightcraft-src
         run: |
           set -euo pipefail
-          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Web/lightcraft_web_bg.wasm'
-          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Wrapper/index.html'
+          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Resources/Web/lightcraft_web_bg.wasm'
+          unzip -l build/LightCraft-unsigned.ipa | grep 'Payload/LightCraft.app/Resources/Wrapper/index.html'
           test "$(unzip -Z -1 build/LightCraft-unsigned.ipa | wc -l | tr -d ' ')" -gt 10
 
       - name: Upload workflow artifact
