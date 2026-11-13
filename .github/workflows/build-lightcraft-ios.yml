@@ -123,6 +123,7 @@ jobs:
           echo "bundle id: $(plutil -extract CFBundleIdentifier raw - < build/shipped.plist)"
           echo "version:   $(plutil -extract CFBundleShortVersionString raw - < build/shipped.plist)"
           echo "minimum:   $(plutil -extract MinimumOSVersion raw - < build/shipped.plist)"
+          test "$(plutil -extract CFBundleShortVersionString raw - < build/shipped.plist)" = "0.21.1"
           unzip -l build/LightCraft-unsigned.ipa | sed -n '1,12p'
 
       - name: Verify packaged assets
