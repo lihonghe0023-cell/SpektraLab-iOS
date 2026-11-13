@@ -585,7 +585,7 @@ jobs:
       # Only on `main`, and only when everything above succeeded -- a failed
       # build must not be published as the latest good one.
       - name: Publish the IPA
-        if: success() && github.ref == 'refs/heads/main'
+        if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/ios-export-memory')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
