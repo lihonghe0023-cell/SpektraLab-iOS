@@ -390,7 +390,7 @@ index 2873171..a2820aa 100644
 +        if (maxPixels > 0 && nativeSize.width > 0 && nativeSize.height > 0) {
 +            const double pixels = nativeSize.width * nativeSize.height;
 +            if (pixels > maxPixels) {
-+                const CGFloat scale = MAX(0.5, sqrt(double(maxPixels) / pixels));
++                const CGFloat scale = MAX(0.5, sqrt((double)maxPixels / pixels));
 +                SPKTrySetter(@"scale factor", ^{
 +                    raw.scaleFactor = scale;
 +                });
