@@ -70,6 +70,7 @@ jobs:
         working-directory: build/lightcraft-src
         run: |
           set -euo pipefail
+          mkdir -p build
           xcodebuild \
             -project LightCraft.xcodeproj \
             -scheme LightCraft \
