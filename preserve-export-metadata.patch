@@ -1,0 +1,130 @@
+From 16e9782c09bd8d51c6e24c9a1cc17ef45f389b55 Mon Sep 17 00:00:00 2001
+From: lihonghe0023-cell <lihonghe0023@gmail.com>
+Date: Fri, 13 Nov 2026 17:05:00 +0800
+Subject: [PATCH] fix(ios): preserve capture metadata when exporting
+
+---
+ ios/SpektraLab/Model/ViewModel.swift | 82 +++++++++++++++++++++++++++++++---
+ 1 file changed, 75 insertions(+), 7 deletions(-)
+diff --git a/ios/SpektraLab/Model/ViewModel.swift b/ios/SpektraLab/Model/ViewModel.swift
+index a23002918ad44f01fcbef2ee773d4af071534d76..dfd667f283a70aff56f6254a87195d534159888c 100644
+--- a/ios/SpektraLab/Model/ViewModel.swift
++++ b/ios/SpektraLab/Model/ViewModel.swift
+@@ -1104,13 +1104,17 @@ final class ViewModel: ObservableObject {
+             CrashLog.begin("导出：JPEG 编码")
+             let cgImage = bitmap.cgImage
+             let jpegURL = try await Task.detached(priority: .userInitiated) {
+-                try Self.writeJPEG(from: cgImage)
++                try Self.writeJPEG(from: cgImage,
++                                   metadataSource: data,
++                                   pixelWidth: bitmap.width,
++                                   pixelHeight: bitmap.height)
+             }.value
+             CrashLog.begin("导出：写入相册")
+             try await PhotoLibrary.saveJPEG(at: jpegURL)
+ 
+             CrashLog.clear()
+-            statusText = String(format: "已导出 %d×%d 到相册", bitmap.width, bitmap.height)
++            statusText = String(format: "已导出 %d×%d 到相册 · 已保留拍摄信息",
++                                bitmap.width, bitmap.height)
+             state = .ready
+         } catch {
+             CrashLog.clear()
+@@ -1163,7 +1167,12 @@ final class ViewModel: ObservableObject {
+     /// the Metal texture into a CPU array and converted every pixel to RGBA8;
+     /// that array, plus the 8-bit Data buffer, was roughly 500 MB at 24 MP and
+     /// was the cause of the export-time jetsam kills.
+-    private nonisolated static func writeJPEG(from cgImage: CGImage) throws -> URL {
++    private nonisolated static func writeJPEG(
++        from cgImage: CGImage,
++        metadataSource: Data,
++        pixelWidth: Int,
++        pixelHeight: Int
++    ) throws -> URL {
+         let url = FileManager.default.temporaryDirectory
+             .appendingPathComponent("SpektraLab-\(UUID().uuidString).jpg")
+         guard let destination = CGImageDestinationCreateWithURL(url as CFURL,
+@@ -1171,10 +1180,10 @@ final class ViewModel: ObservableObject {
+                                                                  1, nil) else {
+             throw ExportError.encodingFailed
+         }
+-        let properties: [CFString: Any] = [
+-            kCGImageDestinationLossyCompressionQuality: 0.92
+-        ]
+-        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
++        let properties = jpegProperties(from: metadataSource,
++                                        pixelWidth: pixelWidth,
++                                        pixelHeight: pixelHeight)
++        CGImageDestinationAddImage(destination, cgImage, properties)
+         guard CGImageDestinationFinalize(destination) else {
+             try? FileManager.default.removeItem(at: url)
+             throw ExportError.encodingFailed
+@@ -1182,6 +1191,65 @@ final class ViewModel: ObservableObject {
+         return url
+     }
+ 
++    /// Carry the camera's own EXIF through the render.
++    ///
++    /// A CGImage holds pixels but no capture metadata. Supplying only the JPEG
++    /// quality here produced a valid image with no camera make/model, lens,
++    /// focal length, aperture, shutter speed, ISO, capture date, or GPS data.
++    /// Copy the metadata dictionaries ImageIO exposes for the original file,
++    /// then replace the fields that describe the old pixel geometry. The
++    /// rendered image is already upright, so its orientation is always 1.
++    private nonisolated static func jpegProperties(
++        from sourceData: Data,
++        pixelWidth: Int,
++        pixelHeight: Int
++    ) -> CFDictionary {
++        var output: [CFString: Any] = [
++            kCGImageDestinationLossyCompressionQuality: 0.92,
++            kCGImagePropertyOrientation: 1,
++            kCGImagePropertyPixelWidth: pixelWidth,
++            kCGImagePropertyPixelHeight: pixelHeight,
++        ]
++
++        guard let source = CGImageSourceCreateWithData(sourceData as CFData, nil),
++              let sourceProperties = CGImageSourceCopyPropertiesAtIndex(
++                source, 0, nil
++              ) as? [CFString: Any] else {
++            return output as CFDictionary
++        }
++
++        // Camera and lens identification lives in EXIF/TIFF; Apple cameras also
++        // use EXIF Aux. Keep the standard descriptive blocks and the location,
++        // rather than copying RAW-only dictionaries that do not apply to JPEG.
++        let inheritedKeys: [CFString] = [
++            kCGImagePropertyExifDictionary,
++            kCGImagePropertyExifAuxDictionary,
++            kCGImagePropertyTIFFDictionary,
++            kCGImagePropertyGPSDictionary,
++            kCGImagePropertyIPTCDictionary,
++            kCGImageProperty8BIMDictionary,
++        ]
++        for key in inheritedKeys {
++            if let dictionary = sourceProperties[key] {
++                output[key] = dictionary
++            }
++        }
++
++        if let exif = output[kCGImagePropertyExifDictionary] as? [CFString: Any] {
++            var updated = exif
++            updated[kCGImagePropertyExifPixelXDimension] = pixelWidth
++            updated[kCGImagePropertyExifPixelYDimension] = pixelHeight
++            output[kCGImagePropertyExifDictionary] = updated
++        }
++        if let tiff = output[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
++            var updated = tiff
++            updated[kCGImagePropertyTIFFOrientation] = 1
++            output[kCGImagePropertyTIFFDictionary] = updated
++        }
++
++        return output as CFDictionary
++    }
++
+ }
+ 
+ /// RAW 原始文件字节（ARW/CR3/DNG…）。优先按 `rawImage` 取原始数据；普通照片
+
+-- 
+2.56.0.windows.4
