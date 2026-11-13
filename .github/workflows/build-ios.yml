@@ -81,6 +81,8 @@ jobs:
       HAVE_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME != '' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Apply export memory fix
+        run: git am ios-export-memory-fix.patch
       - name: Select Xcode 27.2
         run: |
           set -euo pipefail
@@ -308,6 +310,7 @@ jobs:
           # app's Info.plist is correct. Without signing material, build the
           # .app directly and package it by hand in the next step.
           SIGNED=false
+          
           if [ "$HAVE_CERT" = "true" ] && [ "$HAVE_PROFILE" = "true" ] \
              && [ "$HAVE_TEAM" = "true" ] && [ "$HAVE_PROFILE_NAME" = "true" ]; then
             SIGNED=true

@@ -1,0 +1,698 @@
+From 88a786c27303aae0a656b65f99fd8331ab38abcd Mon Sep 17 00:00:00 2001
+From: lihonghe0023-cell <lihonghe0023@gmail.com>
+Date: Fri, 13 Nov 2026 14:26:07 +0800
+Subject: [PATCH] fix(ios): bound full-resolution export memory
+
+---
+ ios/SpektraLab/ContentView.swift             |   4 +-
+ ios/SpektraLab/Import/ImageDecoder.swift     |  90 ++++++++++----
+ ios/SpektraLab/Import/LibRawDecodeSupport.h  |   2 +
+ ios/SpektraLab/Import/LibRawDecodeSupport.mm |  40 ++++---
+ ios/SpektraLab/Import/RAWDecodeSupport.h     |   7 +-
+ ios/SpektraLab/Import/RAWDecodeSupport.m     |  23 +++-
+ ios/SpektraLab/Model/ViewModel.swift         | 117 ++++++++++++++-----
+ ios/SpektraLab/Service/CrashLog.swift        |  18 ++-
+ ios/SpektraLab/Service/DecoderProbe.swift    |   3 +-
+ ios/SpektraLab/Service/EngineBridge.swift    |  13 ++-
+ 10 files changed, 238 insertions(+), 79 deletions(-)
+
+diff --git a/ios/SpektraLab/ContentView.swift b/ios/SpektraLab/ContentView.swift
+index ffec4da..a42e81b 100644
+--- a/ios/SpektraLab/ContentView.swift
++++ b/ios/SpektraLab/ContentView.swift
+@@ -321,8 +321,8 @@ struct EditorView: View {
+                                 .labGlassInteractive(in: Circle())
+                         }
+                         .buttonStyle(.plain)
+-                        .disabled(model.renderedTexture == nil)
+-                        .opacity(model.renderedTexture == nil ? 0.4 : 1)
++                        .disabled(model.renderedTexture == nil || model.state == .importing)
++                        .opacity(model.renderedTexture == nil || model.state == .importing ? 0.4 : 1)
+                     }
+                 }
+             }
+diff --git a/ios/SpektraLab/Import/ImageDecoder.swift b/ios/SpektraLab/Import/ImageDecoder.swift
+index feeec24..4a90d8a 100644
+--- a/ios/SpektraLab/Import/ImageDecoder.swift
++++ b/ios/SpektraLab/Import/ImageDecoder.swift
+@@ -20,12 +20,11 @@ import CoreGraphics
+ import ImageIO
+ import UniformTypeIdentifiers
+ 
+-/// Tightly packed float32 RGB pixels.
++/// Tightly packed float32 pixels.
+ ///
+ /// Core Image's path already produces a `[Float]`; LibRaw hands us an NSData
+-/// that already owns the decoded frame. Keeping both behind one accessor lets
+-/// the LibRaw fallback avoid a second full-resolution copy on the way from
+-/// the decoder to the engine.
++/// that already owns the decoded frame. The frame records whether the pixels
++/// are RGB or RGBA, so the export path can skip a second full-resolution copy.
+ struct FloatRGBPixels: @unchecked Sendable {
+     /// Owns a frame returned by the LibRaw bridge. The C layer keeps the
+     /// vector alive until `SPKLibRawFrameFree`, so the pixels can go to the
+@@ -109,10 +108,20 @@ struct FloatRGBPixels: @unchecked Sendable {
+ 
+ /// A decoded frame, in the engine's input space.
+ struct DecodedFrame: @unchecked Sendable {
+-    /// Tightly packed float32, three channels, top row first.
++    /// Tightly packed float32, top row first. Preview frames carry three
++    /// channels; the export path can keep Core Image's fourth channel so it
++    /// does not allocate a second full-resolution RGB frame.
+     let pixels: FloatRGBPixels
+     let width: Int
+     let height: Int
++    let channels: Int
++
++    init(pixels: FloatRGBPixels, width: Int, height: Int, channels: Int = 3) {
++        self.pixels = pixels
++        self.width = width
++        self.height = height
++        self.channels = channels
++    }
+ 
+     var megapixels: Double { Double(width * height) / 1_000_000 }
+ 
+@@ -136,22 +145,23 @@ struct DecodedFrame: @unchecked Sendable {
+ 
+     private func cropped(to crop: (x: Int, y: Int, width: Int, height: Int)) -> DecodedFrame {
+         guard crop.width != width || crop.height != height else { return self }
+-        var output = [Float](repeating: 0, count: crop.width * crop.height * 3)
++        var output = [Float](repeating: 0, count: crop.width * crop.height * channels)
+         pixels.withUnsafeBufferPointer { source in
+             guard let source = source.baseAddress else { return }
+             output.withUnsafeMutableBufferPointer { destination in
+                 guard let destination = destination.baseAddress else { return }
+                 for row in 0..<crop.height {
+-                    let from = ((crop.y + row) * width + crop.x) * 3
+-                    let to = row * crop.width * 3
++                    let from = ((crop.y + row) * width + crop.x) * channels
++                    let to = row * crop.width * channels
+                     destination.advanced(by: to).update(
+-                        from: source.advanced(by: from), count: crop.width * 3)
++                        from: source.advanced(by: from), count: crop.width * channels)
+                 }
+             }
+         }
+         return DecodedFrame(pixels: FloatRGBPixels(output),
+                             width: crop.width,
+-                            height: crop.height)
++                            height: crop.height,
++                            channels: channels)
+     }
+ }
+ 
+@@ -199,6 +209,18 @@ enum ImageDecoder {
+     /// Export at the source resolution; only the interactive preview shrinks.
+     static let exportLongEdge: Int? = nil
+ 
++    /// Full-source export can otherwise overlap a 48 MP host decode, the
++    /// engine's full-size source/negative buffers and the 16-bit result. On an
++    /// 8 GB iPhone that exceeds the process memory allowance and iOS terminates
++    /// the app without reaching Swift's `catch`. This budget leaves the source
++    /// untouched when it already fits; larger files are scaled down while
++    /// preserving their aspect ratio and film-gate crop.
++    static var exportPixelLimit: Int {
++        let processBudget = ProcessInfo.processInfo.physicalMemory / 7
++        let pixelsThatFit = Int(processBudget / 56)
++        return min(24_000_000, max(6_000_000, pixelsThatFit))
++    }
++
+     /// The exact float working space used by the Mac 1.3.5 decoder.
+     private static let linearProPhoto: CGColorSpace? = {
+         let d50: [CGFloat] = [0.9642, 1.0000, 0.8249]
+@@ -235,7 +257,9 @@ enum ImageDecoder {
+     /// - Parameter maxLongEdge: the long edge to scale to, or `nil` for no
+     ///   scaling (the export path).
+     static func decode(data: Data, maxLongEdge: Int?, typeHint: UTType? = nil,
+-                       aspect: CGFloat? = nil, targetAspect: CGFloat? = nil) throws -> DecodedFrame {
++                       aspect: CGFloat? = nil, targetAspect: CGFloat? = nil,
++                       pixelLimit: Int? = nil,
++                       includeAlpha: Bool = false) throws -> DecodedFrame {
+         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+             throw DecodeError.unreadable("not an image this system recognises")
+         }
+@@ -262,7 +286,8 @@ enum ImageDecoder {
+ #else
+             let forceLibRaw = false
+ #endif
+-            if !forceLibRaw, let output = SPKDecodeRAWImage(data, identifier) {
++            if !forceLibRaw,
++               let output = SPKDecodeRAWImage(data, identifier, pixelLimit ?? 0) {
+                 // A filter object can exist while its `outputImage` is empty,
+                 // and iOS can also answer with an embedded thumbnail instead
+                 // of the sensor frame (Nikon NEF does this on iOS 27). Both
+@@ -277,7 +302,9 @@ enum ImageDecoder {
+                 } else {
+                     do {
+                         return try pixels(from: output, maxLongEdge: maxLongEdge,
+-                                          aspect: aspect, targetAspect: targetAspect)
++                                          aspect: aspect, targetAspect: targetAspect,
++                                          pixelLimit: pixelLimit,
++                                          includeAlpha: includeAlpha)
+                     } catch {
+                         NSLog("SpektraLab Core Image RAW path failed for %@: %@",
+                               identifier ?? "unknown", error.localizedDescription)
+@@ -294,7 +321,8 @@ enum ImageDecoder {
+                 return try decodeWithLibRaw(data: data, typeHint: resolvedHint,
+                                             identifier: identifier,
+                                             maxLongEdge: maxLongEdge,
+-                                            aspect: aspect, targetAspect: targetAspect)
++                                            aspect: aspect, targetAspect: targetAspect,
++                                            pixelLimit: pixelLimit)
+             } catch {
+                 guard !authoritativeRAW else { throw error }
+                 // The RAW UTI came from a byte signature, not ImageIO or the
+@@ -307,7 +335,9 @@ enum ImageDecoder {
+         }
+         if let image = CIImage(data: data, options: [.applyOrientationProperty: true]) {
+             return try pixels(from: image, maxLongEdge: maxLongEdge,
+-                              aspect: aspect, targetAspect: targetAspect)
++                              aspect: aspect, targetAspect: targetAspect,
++                              pixelLimit: pixelLimit,
++                              includeAlpha: includeAlpha)
+         }
+ 
+         // A TIFF-based RAW can arrive here when ImageIO reports public.tiff
+@@ -323,7 +353,8 @@ enum ImageDecoder {
+                                             identifier: rawIdentifier(source: source,
+                                                                       typeHint: resolvedHint),
+                                             maxLongEdge: maxLongEdge,
+-                                            aspect: aspect, targetAspect: targetAspect)
++                                            aspect: aspect, targetAspect: targetAspect,
++                                            pixelLimit: pixelLimit)
+             } catch {
+                 throw DecodeError.unreadable(
+                     "Core Image could not decode this TIFF; \(error.localizedDescription)")
+@@ -334,7 +365,8 @@ enum ImageDecoder {
+ 
+     private static func decodeWithLibRaw(data: Data, typeHint: UTType?,
+                                          identifier: String?, maxLongEdge: Int?,
+-                                         aspect: CGFloat?, targetAspect: CGFloat?) throws -> DecodedFrame {
++                                         aspect: CGFloat?, targetAspect: CGFloat?,
++                                         pixelLimit: Int?) throws -> DecodedFrame {
+         var width = 0
+         var height = 0
+         let suffix = typeHint?.preferredFilenameExtension
+@@ -343,6 +375,7 @@ enum ImageDecoder {
+             data,
+             suffix,
+             maxLongEdge ?? 0,
++            pixelLimit ?? 0,
+             aspect.map(Double.init) ?? 0,
+             targetAspect.map(Double.init) ?? 0,
+             &width,
+@@ -497,7 +530,9 @@ enum ImageDecoder {
+     /// intermediate or a hand-written colour matrix.
+     private static func pixels(from source: CIImage, maxLongEdge: Int?,
+                                aspect: CGFloat? = nil,
+-                               targetAspect: CGFloat? = nil) throws -> DecodedFrame {
++                               targetAspect: CGFloat? = nil,
++                               pixelLimit: Int? = nil,
++                               includeAlpha: Bool = false) throws -> DecodedFrame {
+         guard let colorSpace = linearProPhoto else {
+             throw DecodeError.unreadable("linear ProPhoto RGB is unavailable")
+         }
+@@ -525,13 +560,22 @@ enum ImageDecoder {
+                                   height: CGFloat(crop.height))
+             image = image.cropped(to: sourceExtent)
+         }
++        var scale: CGFloat = 1
+         if let maxLongEdge {
+             let current = max(sourceExtent.width, sourceExtent.height)
+             if current > CGFloat(maxLongEdge), current.isFinite {
+-                let factor = CGFloat(maxLongEdge) / current
+-                image = image.transformed(by: CGAffineTransform(scaleX: factor, y: factor))
++                scale = min(scale, CGFloat(maxLongEdge) / current)
+             }
+         }
++        if let pixelLimit, pixelLimit > 0 {
++            let pixels = sourceExtent.width * sourceExtent.height
++            if pixels > CGFloat(pixelLimit), pixels.isFinite {
++                scale = min(scale, sqrt(CGFloat(pixelLimit) / pixels))
++            }
++        }
++        if scale < 1 {
++            image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
++        }
+         let extent = image.extent.integral
+         let width = Int(extent.width), height = Int(extent.height)
+         guard width > 0, height > 0 else { throw DecodeError.emptyImage }
+@@ -547,6 +591,12 @@ enum ImageDecoder {
+                            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                            format: .RGBAf, colorSpace: colorSpace)
+         }
++        if includeAlpha {
++            return DecodedFrame(pixels: FloatRGBPixels(rgba),
++                                width: width,
++                                height: height,
++                                channels: 4)
++        }
+         var rgb = [Float](repeating: 0, count: width * height * 3)
+         for pixel in 0..<(width * height) {
+             rgb[pixel * 3] = rgba[pixel * 4]
+diff --git a/ios/SpektraLab/Import/LibRawDecodeSupport.h b/ios/SpektraLab/Import/LibRawDecodeSupport.h
+index 372225a..0a665e2 100644
+--- a/ios/SpektraLab/Import/LibRawDecodeSupport.h
++++ b/ios/SpektraLab/Import/LibRawDecodeSupport.h
+@@ -23,9 +23,11 @@ typedef void *SPKLibRawFrameRef;
+ /// `aspect` is long edge over short edge and preserves the frame's own
+ /// orientation; `targetAspect` is an exact width/height crop and overrides it.
+ /// Either can be 0 to leave that crop unset; both 0 leaves the frame uncropped.
++/// `maxLongEdge` and `maxPixels` may be 0; otherwise the tighter limit wins.
+ SPKLibRawFrameRef _Nullable SPKLibRawDecode(NSData *data,
+                                             NSString * _Nullable filenameExtension,
+                                             NSInteger maxLongEdge,
++                                            NSInteger maxPixels,
+                                             double aspect,
+                                             double targetAspect,
+                                             NSInteger *width,
+diff --git a/ios/SpektraLab/Import/LibRawDecodeSupport.mm b/ios/SpektraLab/Import/LibRawDecodeSupport.mm
+index 57a4bc8..77bcb40 100644
+--- a/ios/SpektraLab/Import/LibRawDecodeSupport.mm
++++ b/ios/SpektraLab/Import/LibRawDecodeSupport.mm
+@@ -58,13 +58,28 @@ void center_crop(std::vector<float> &pixels, uint32_t &width, uint32_t &height,
+ 
+ std::vector<float> resample(const std::vector<float> &source,
+                             NSInteger width, NSInteger height,
+-                            NSInteger maxLongEdge) {
++                            NSInteger maxLongEdge, NSInteger maxPixels,
++                            NSInteger *outputWidth, NSInteger *outputHeight) {
+     const NSInteger longEdge = std::max(width, height);
+-    if (maxLongEdge <= 0 || longEdge <= maxLongEdge) return {};
++    double scale = 1.0;
++    if (maxLongEdge > 0 && longEdge > maxLongEdge) {
++        scale = std::min(scale, double(maxLongEdge) / double(longEdge));
++    }
++    if (maxPixels > 0 && width * height > maxPixels) {
++        scale = std::min(scale, std::sqrt(double(maxPixels) / (double(width) * height)));
++    }
++    if (scale >= 1.0) {
++        if (outputWidth) *outputWidth = width;
++        if (outputHeight) *outputHeight = height;
++        return {};
++    }
+ 
+-    const double scale = double(maxLongEdge) / double(longEdge);
+-    const NSInteger targetWidth = std::max<NSInteger>(1, std::llround(width * scale));
+-    const NSInteger targetHeight = std::max<NSInteger>(1, std::llround(height * scale));
++    // Floor both dimensions so rounding can never put the result back above
++    // the requested pixel budget.
++    const NSInteger targetWidth = std::max<NSInteger>(1, std::floor(width * scale));
++    const NSInteger targetHeight = std::max<NSInteger>(1, std::floor(height * scale));
++    if (outputWidth) *outputWidth = targetWidth;
++    if (outputHeight) *outputHeight = targetHeight;
+     std::vector<float> output(std::size_t(targetWidth) * targetHeight * 3);
+ 
+     const double xStep = double(width) / double(targetWidth);
+@@ -100,6 +115,7 @@ std::vector<float> resample(const std::vector<float> &source,
+ SPKLibRawFrameRef SPKLibRawDecode(NSData *data,
+                                   NSString *filenameExtension,
+                                   NSInteger maxLongEdge,
++                                  NSInteger maxPixels,
+                                   double aspect,
+                                   double targetAspect,
+                                   NSInteger *width,
+@@ -136,16 +152,12 @@ SPKLibRawFrameRef SPKLibRawDecode(NSData *data,
+ 
+     center_crop(decoded.rgb, decoded.width, decoded.height, aspect, targetAspect);
+ 
+-    std::vector<float> reduced = resample(decoded.rgb, decoded.width, decoded.height, maxLongEdge);
++    NSInteger resolvedWidth = decoded.width;
++    NSInteger resolvedHeight = decoded.height;
++    std::vector<float> reduced = resample(decoded.rgb, decoded.width, decoded.height,
++                                          maxLongEdge, maxPixels,
++                                          &resolvedWidth, &resolvedHeight);
+     const bool didResample = !reduced.empty();
+-    const NSInteger resolvedWidth = didResample
+-        ? std::max<NSInteger>(1, std::llround(decoded.width
+-            * (double(maxLongEdge) / double(std::max(decoded.width, decoded.height)))))
+-        : decoded.width;
+-    const NSInteger resolvedHeight = didResample
+-        ? std::max<NSInteger>(1, std::llround(decoded.height
+-            * (double(maxLongEdge) / double(std::max(decoded.width, decoded.height)))))
+-        : decoded.height;
+ 
+     auto *result = new SPKLibRawFrame{
+         didResample ? std::move(reduced) : std::move(decoded.rgb)
+diff --git a/ios/SpektraLab/Import/RAWDecodeSupport.h b/ios/SpektraLab/Import/RAWDecodeSupport.h
+index 1c618b7..4c84513 100644
+--- a/ios/SpektraLab/Import/RAWDecodeSupport.h
++++ b/ios/SpektraLab/Import/RAWDecodeSupport.h
+@@ -10,6 +10,11 @@ NS_ASSUME_NONNULL_BEGIN
+ /// iOS version, and some implementations do not expose every settable
+ /// property. Objective-C catches that exception where Swift cannot, keeping
+ /// an unsupported property from terminating the app during import.
+-CIImage * _Nullable SPKDecodeRAWImage(NSData *data, NSString * _Nullable identifierHint);
++///
++/// `maxPixels` may scale large RAW files at decode time; zero preserves the
++/// sensor extent. The caller still applies its own exact crop and final budget.
++CIImage * _Nullable SPKDecodeRAWImage(NSData *data,
++                                      NSString * _Nullable identifierHint,
++                                      NSInteger maxPixels);
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/ios/SpektraLab/Import/RAWDecodeSupport.m b/ios/SpektraLab/Import/RAWDecodeSupport.m
+index 2873171..a2820aa 100644
+--- a/ios/SpektraLab/Import/RAWDecodeSupport.m
++++ b/ios/SpektraLab/Import/RAWDecodeSupport.m
+@@ -1,6 +1,7 @@
+ #import "RAWDecodeSupport.h"
+ 
+ #import <CoreImage/CIRAWFilter.h>
++#import <math.h>
+ 
+ static void SPKTrySetter(NSString *name, void (^body)(void)) {
+     @try {
+@@ -10,7 +11,7 @@ static void SPKTrySetter(NSString *name, void (^body)(void)) {
+     }
+ }
+ 
+-CIImage *SPKDecodeRAWImage(NSData *data, NSString *identifierHint) {
++CIImage *SPKDecodeRAWImage(NSData *data, NSString *identifierHint, NSInteger maxPixels) {
+     @try {
+         CIRAWFilter *raw = [CIRAWFilter filterWithImageData:data
+                                             identifierHint:identifierHint];
+@@ -42,16 +43,26 @@ CIImage *SPKDecodeRAWImage(NSData *data, NSString *identifierHint) {
+             raw.extendedDynamicRangeAmount = 0;
+         });
+ 
+-        CIImage *output = raw.outputImage;
+-        if (output == nil) {
+-            return nil;
+-        }
+-
+         // iOS sometimes returns an embedded preview instead of the sensor
+         // frame. NEF hits this on iOS 27: the output is 120x160 while the
+         // filter's own nativeSize is 6048x4024. Reporting nil sends the file
+         // to the LibRaw fallback, which decodes the real frame.
+         const CGSize nativeSize = raw.nativeSize;
++        if (maxPixels > 0 && nativeSize.width > 0 && nativeSize.height > 0) {
++            const double pixels = nativeSize.width * nativeSize.height;
++            if (pixels > maxPixels) {
++                const CGFloat scale = MAX(0.5, sqrt((double)maxPixels / pixels));
++                SPKTrySetter(@"scale factor", ^{
++                    raw.scaleFactor = scale;
++                });
++            }
++        }
++
++        CIImage *output = raw.outputImage;
++        if (output == nil) {
++            return nil;
++        }
++
+         const CGRect extent = output.extent;
+         if (getenv("SPEKTRAFILM_RAW_LOG") != NULL) {
+             NSLog(@"SpektraLab RAW filter native=%.0fx%.0f extent=%.0fx%.0f scale=%.3f",
+diff --git a/ios/SpektraLab/Model/ViewModel.swift b/ios/SpektraLab/Model/ViewModel.swift
+index 115c7fe..a230029 100644
+--- a/ios/SpektraLab/Model/ViewModel.swift
++++ b/ios/SpektraLab/Model/ViewModel.swift
+@@ -201,9 +201,13 @@ final class ViewModel: ObservableObject {
+     private var renderInFlight = false
+     private var needsRender = false
+     private var paramsDirty = false
++    private var exportInFlight = false
+     /// The recipe the editor opened with. `closeEditor` compares against it so
+     /// merely viewing a photo does not mark it as edited.
+     private var editingBaseRecipe: PhotoRecipe?
++    /// Read once while the model starts, then shown only after the engine has
++    /// finished its own startup so a readiness message cannot hide it.
++    private let startupCrash: String? = CrashLog.take()
+ 
+     // MARK: - life cycle
+ 
+@@ -233,6 +237,7 @@ final class ViewModel: ObservableObject {
+             self.renderer = CanvasRenderer(device: device)
+             state = .empty
+             statusText = "就绪 · \(catalog.films.count) 款胶片 · \(catalog.papers.count) 款相纸"
++            reportPreviousCrash()
+         } catch {
+             // The CI build does not ship the resource archive inside the .app:
+             // a 15 MB payload makes the side-loading installer fail when it
+@@ -259,6 +264,7 @@ final class ViewModel: ObservableObject {
+             self.renderer = CanvasRenderer(device: device)
+             state = .empty
+             statusText = "就绪 · \(catalog.films.count) 款胶片 · \(catalog.papers.count) 款相纸"
++            reportPreviousCrash()
+         } catch {
+             state = .failed(error.localizedDescription)
+             statusText = "资源准备失败"
+@@ -268,7 +274,7 @@ final class ViewModel: ObservableObject {
+     /// Puts the previous run's crash on screen, so it does not take another
+     /// cycle of "it just closes" to find out what happened.
+     private func reportPreviousCrash() {
+-        guard let crash = CrashLog.take() else { return }
++        guard let crash = startupCrash else { return }
+         state = .failed("上次异常退出：\(crash)")
+         statusText = "上次异常退出 · \(crash)"
+     }
+@@ -725,7 +731,8 @@ final class ViewModel: ObservableObject {
+                 }
+                 _ = try engine.open(pixels: EnginePixels(data: base,
+                                                          width: framed.width,
+-                                                         height: framed.height),
++                                                         height: framed.height,
++                                                         channels: framed.channels),
+                                     params: openDelta)
+             }
+             try engine.solve(target: "both")
+@@ -759,7 +766,8 @@ final class ViewModel: ObservableObject {
+                 return try engine.open(pixels: EnginePixels(
+                     data: base,
+                     width: decoded.width,
+-                    height: decoded.height), params: openDelta)
++                    height: decoded.height,
++                    channels: decoded.channels), params: openDelta)
+             }
+         }
+ 
+@@ -953,7 +961,8 @@ final class ViewModel: ObservableObject {
+                         _ = try engine.open(pixels: EnginePixels(
+                             data: base,
+                             width: frame.width,
+-                            height: frame.height), params: openDelta)
++                            height: frame.height,
++                            channels: frame.channels), params: openDelta)
+                     }
+                     try engine.solve(target: "both")
+                 }
+@@ -1045,62 +1054,106 @@ final class ViewModel: ObservableObject {
+ 
+     /// Export the print to the photo library.
+     ///
+-    /// Decode the source at its original resolution and render in strips.
++    /// Decode and render at the largest resolution that safely fits this
++    /// process. A 48 MP source used to overlap its host decode, three GPU
++    /// full-frame buffers and the 16-bit result; iOS killed the app before the
++    /// UI could report an error.
+     func exportToPhotos() async {
+-        guard let engine, let originalData else {
++        guard !exportInFlight else { return }
++        exportInFlight = true
++        defer { exportInFlight = false }
++        guard let engine, let device, let originalData else {
+             statusText = "还没有可导出的照片"
+             return
+         }
+         state = .importing
+         statusText = "正在导出高质量 JPEG…"
++        CrashLog.begin("导出：解码")
+ 
+         do {
+             let data = originalData
+             let hint = originalTypeHint
+             let cropAspect = filmBorderEnabled ? filmCropAspect : nil
+-            // Decoding a RAW container is CPU-heavy. Do it off the main actor
+-            // so the export sheet keeps moving and the UI never freezes.
+-            let full = try await Task.detached(priority: .userInitiated) {
+-                try ImageDecoder.decode(data: data,
+-                                        maxLongEdge: ImageDecoder.exportLongEdge,
+-                                        typeHint: hint,
+-                                        targetAspect: cropAspect)
+-            }.value
+-
+             let exportDelta = currentOpenDelta()
+-
+-            // Open, solve and render are one unit on the engine's serial
+-            // queue. `full` stays alive only until `open` copies it; the
+-            // exported image then owns the engine's 16-bit rows directly.
+-            let bitmap = try await engine.perform {
+-                try full.pixels.withUnsafeBufferPointer { buffer in
+-                    guard let base = buffer.baseAddress else {
+-                        throw EngineError.failed(status: -1, message: "解码结果为空")
+-                    }
+-                    _ = try engine.open(pixels: EnginePixels(
+-                        data: base,
+-                        width: full.width,
+-                        height: full.height), params: exportDelta)
++            let resources = engine.resources
++            let pixelLimit = ImageDecoder.exportPixelLimit
++
++            // The export engine is deliberately temporary. Destroying it after
++            // the render releases the source, negative, pipeline arena and
++            // texture pool before JPEG encoding and the Photos write, instead
++            // of leaving them resident beside the editor's own session.
++            CrashLog.begin("导出：全尺寸渲染")
++            let bitmap = try await Task.detached(priority: .userInitiated) {
++                let exportEngine = try await Self.makeFullExportEngine(
++                    device: device,
++                    resources: resources,
++                    data: data,
++                    typeHint: hint,
++                    cropAspect: cropAspect,
++                    pixelLimit: pixelLimit,
++                    params: exportDelta)
++                return try await exportEngine.perform {
++                    try exportEngine.solve(target: "both")
++                    return try exportEngine.renderBitmap(tier: "full", reprint: false)
+                 }
+-                try engine.solve(target: "both")
+-                return try engine.renderBitmap(tier: "full", reprint: false)
+-            }
++            }.value
+ 
+             // Encode on a background task as well: JPEG compression is the
+             // second-long part after a 24 MP render and does not need the main
+             // actor. No UIImage and no full-size JPEG Data are created.
++            CrashLog.begin("导出：JPEG 编码")
+             let cgImage = bitmap.cgImage
+             let jpegURL = try await Task.detached(priority: .userInitiated) {
+                 try Self.writeJPEG(from: cgImage)
+             }.value
++            CrashLog.begin("导出：写入相册")
+             try await PhotoLibrary.saveJPEG(at: jpegURL)
+ 
++            CrashLog.clear()
+             statusText = String(format: "已导出 %d×%d 到相册", bitmap.width, bitmap.height)
+             state = .ready
+         } catch {
++            CrashLog.clear()
+             state = .failed(error.localizedDescription)
+-            statusText = "导出失败"
++            statusText = "导出失败：\(error.localizedDescription)"
++        }
++    }
++
++    /// Decode into Core Image's four-channel float output and hand it to the
++    /// engine without first materialising a second three-channel RGB array.
++    /// Returning the engine releases the decoded host frame when this function
++    /// returns, so the render does not overlap that allocation.
++    private nonisolated static func makeFullExportEngine(
++        device: MTLDevice,
++        resources: URL,
++        data: Data,
++        typeHint: UTType?,
++        cropAspect: CGFloat?,
++        pixelLimit: Int,
++        params: [String: ParamValue]
++    ) async throws -> SpektraEngine {
++        let full = try autoreleasepool {
++            try ImageDecoder.decode(data: data,
++                                    maxLongEdge: ImageDecoder.exportLongEdge,
++                                    typeHint: typeHint,
++                                    targetAspect: cropAspect,
++                                    pixelLimit: pixelLimit,
++                                    includeAlpha: true)
++        }
++        let engine = try SpektraEngine(device: device, resources: resources)
++        try await engine.perform {
++            try full.pixels.withUnsafeBufferPointer { buffer in
++                guard let base = buffer.baseAddress else {
++                    throw EngineError.failed(status: -1, message: "解码结果为空")
++                }
++                _ = try engine.open(pixels: EnginePixels(
++                    data: base,
++                    width: full.width,
++                    height: full.height,
++                    channels: full.channels), params: params)
++            }
+         }
++        return engine
+     }
+ 
+     /// Write the engine's 16-bit sRGB image as a JPEG.
+diff --git a/ios/SpektraLab/Service/CrashLog.swift b/ios/SpektraLab/Service/CrashLog.swift
+index 731ff5a..2fe7bff 100644
+--- a/ios/SpektraLab/Service/CrashLog.swift
++++ b/ios/SpektraLab/Service/CrashLog.swift
+@@ -50,7 +50,23 @@ enum CrashLog {
+ 
+     /// Leave the note. Called from a signal handler, so it stays small.
+     static func record(_ text: String) {
+-        UserDefaults.standard.set(text, forKey: key)
++        let stage = UserDefaults.standard.string(forKey: key)
++        let detail = stage.map { "\(text) · \($0)" } ?? text
++        UserDefaults.standard.set(detail, forKey: key)
++        UserDefaults.standard.synchronize()
++    }
++
++    /// Mark a stage that runs below a `catch`. Jetsam/OOM termination and some
++    /// native crashes never return an error, so the next launch uses this note
++    /// to tell us whether decode, render, encode or the Photos write was last.
++    static func begin(_ stage: String) {
++        UserDefaults.standard.set("stage: \(stage)", forKey: key)
++        UserDefaults.standard.synchronize()
++    }
++
++    /// The operation completed normally; do not report it as a crash next time.
++    static func clear() {
++        UserDefaults.standard.removeObject(forKey: key)
+         UserDefaults.standard.synchronize()
+     }
+ 
+diff --git a/ios/SpektraLab/Service/DecoderProbe.swift b/ios/SpektraLab/Service/DecoderProbe.swift
+index 1d72038..8262061 100644
+--- a/ios/SpektraLab/Service/DecoderProbe.swift
++++ b/ios/SpektraLab/Service/DecoderProbe.swift
+@@ -144,7 +144,8 @@ enum DecoderProbe {
+                         _ = try engine.open(pixels: EnginePixels(
+                             data: base,
+                             width: frame.width,
+-                            height: frame.height
++                            height: frame.height,
++                            channels: frame.channels
+                         ), params: openDelta)
+                     }
+                     _ = try engine.solve(target: "both")
+diff --git a/ios/SpektraLab/Service/EngineBridge.swift b/ios/SpektraLab/Service/EngineBridge.swift
+index 3f7e5e1..578caf3 100644
+--- a/ios/SpektraLab/Service/EngineBridge.swift
++++ b/ios/SpektraLab/Service/EngineBridge.swift
+@@ -350,7 +350,8 @@ final class SpektraEngine: @unchecked Sendable {
+         let json = try encode(delta)
+         var reply: UnsafeMutablePointer<CChar>?
+         var image = spk_image(data: pixels.data, width: UInt32(pixels.width),
+-                              height: UInt32(pixels.height), channels: 3)
++                              height: UInt32(pixels.height),
++                              channels: UInt32(pixels.channels))
+         let handle: OpaquePointer? = json.withCString { deltaPtr in
+             withUnsafePointer(to: &image) { spk_open(engine, $0, deltaPtr, &reply) }
+         }
+@@ -588,13 +589,21 @@ final class SpektraEngine: @unchecked Sendable {
+ // MARK: - Pixel carriers
+ 
+ /// A decoded frame in host memory: tightly packed float32, top row first,
+-/// three channels (RGB).
++/// and either three (RGB) or four (RGBA) channels.
+ ///
+ /// The engine copies what it keeps, so this can be freed right after `open`.
+ struct EnginePixels {
+     let data: UnsafePointer<Float>
+     let width: Int
+     let height: Int
++    let channels: Int
++
++    init(data: UnsafePointer<Float>, width: Int, height: Int, channels: Int = 3) {
++        self.data = data
++        self.width = width
++        self.height = height
++        self.channels = channels
++    }
+ }
+ 
+ /// A decoded frame already in GPU-visible memory.
+-- 
+2.56.0.windows.4
+
